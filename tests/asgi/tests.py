@@ -1,8 +1,10 @@
 import asyncio
+import gc
 import sys
 import tempfile
 import threading
 import time
+import weakref
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -12,7 +14,7 @@ from asgiref.testing import ApplicationCommunicator
 
 from django.contrib.staticfiles.handlers import ASGIStaticFilesHandler
 from django.core.asgi import get_asgi_application
-from django.core.exceptions import RequestDataTooBig
+from django.core.exceptions import RequestDataTooBig, RequestAborted
 from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.core.handlers.asgi import ASGIHandler, ASGIRequest
 from django.core.signals import request_finished, request_started
@@ -446,6 +448,55 @@ class ASGITest(SimpleTestCase):
         await communicator.send_input({"type": "http.disconnect"})
         with self.assertRaises(asyncio.TimeoutError):
             await communicator.receive_output()
+
+    async def test_disconnect_reference_cycle(self):
+        view_started = asyncio.Event()
+        exception_ref = None
+
+        async def exception_listener(handler, receive):
+            nonlocal exception_ref
+            try:
+                await ASGIHandler.listen_for_disconnect(handler, receive)
+            except Exception as e:
+                exception_ref = weakref.ref(e)
+                raise
+
+        async def view(request):
+            view_started.set()
+            await asyncio.sleep(1)
+            return HttpResponse("Hello World!")
+
+        class TestASGIRequest(ASGIRequest):
+            urlconf = (path("slow/", view),)
+
+        class TestASGIHandler(ASGIHandler):
+            request_class = TestASGIRequest
+            listen_for_disconnect = exception_listener
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            application = TestASGIHandler()
+            scope = self.async_request_factory._base_scope(path="/slow/")
+            communicator = ApplicationCommunicator(application, scope)
+
+            await communicator.send_input({"type": "http.request"})
+            await view_started.wait()
+            await communicator.send_input({"type": "http.disconnect"})
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await communicator.receive_output()
+            await communicator.wait()
+
+            self.assertIsNotNone(exception_ref, "Failed to capture RequestAborted weakref")
+            self.assertIsNone(
+                exception_ref(),
+                "RequestAborted instance still alive after handle() returned — "
+                "likely a reference cycle",
+            )
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
     async def test_wrong_connection_type(self):
         application = get_asgi_application()
